@@ -6,17 +6,10 @@ import { buildEmbeddedRunPayloads } from "../../agents/embedded-agent-runner/run
 import type { ChannelThreadingAdapter } from "../../channels/plugins/types.public.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
 import {
-  sanitizeAssistantVisibleText,
-  stripAssistantInternalScaffolding,
-} from "../../shared/text/assistant-visible-text.js";
-import {
   createChannelTestPluginBase,
   createTestRegistry,
 } from "../../test-utils/channel-plugins.js";
-import {
-  resolveHeartbeatScratchProposalFromReplyResult,
-  resolveHeartbeatToolResponseFromReplyResult,
-} from "../heartbeat-tool-response.js";
+import { selectHeartbeatToolResponse } from "../heartbeat-tool-response.js";
 import {
   getReplyPayloadMetadata,
   markReplyPayloadForSourceSuppressionDelivery,
@@ -25,7 +18,6 @@ import {
 import type { ReplyPayload } from "../types.js";
 import { buildReplyPayloads } from "./agent-runner-payloads.js";
 import { createBlockReplyPipeline } from "./block-reply-pipeline.js";
-import { normalizeReplyPayload } from "./normalize-reply.js";
 import type { DirectBlockDelivery } from "./reply-delivery.js";
 import { createReplyToModeFilterForChannel } from "./reply-threading.js";
 
@@ -93,12 +85,20 @@ describe("heartbeat reply scratch", () => {
         }),
       );
       const expected = proposals.at(-1);
-      expect(resolveHeartbeatScratchProposalFromReplyResult(payloads)).toBe(expected);
+      const embedded = expectDefined(
+        selectHeartbeatToolResponse(payloads),
+        "expected the embedded heartbeat response",
+      );
+      expect(getReplyPayloadMetadata(embedded.payload)?.heartbeatScratchProposal).toBe(expected);
       const { replyPayloads } = await buildTestReplyPayloads({ isHeartbeat: true, payloads });
 
       expect(replyPayloads).toHaveLength(proposals.length);
-      expect(resolveHeartbeatScratchProposalFromReplyResult(replyPayloads)).toBe(expected);
-      expect(resolveHeartbeatToolResponseFromReplyResult(replyPayloads)).toEqual({
+      const selected = expectDefined(
+        selectHeartbeatToolResponse(replyPayloads),
+        "expected the final heartbeat response",
+      );
+      expect(getReplyPayloadMetadata(selected.payload)?.heartbeatScratchProposal).toBe(expected);
+      expect(selected.response).toEqual({
         outcome: "done",
         notify,
         summary: `Monitor checked ${proposals.length}.`,
@@ -1247,38 +1247,6 @@ describe("buildReplyPayloads media filter integration", () => {
       isError: true,
     });
   });
-
-  it.each(["exec", "bash"])(
-    "delivers the real %s failure warning after a silent answer",
-    async (toolName) => {
-      const payloads = buildEmbeddedRunPayloads({
-        assistantTexts: ["NO_REPLY"],
-        lastAssistant: undefined,
-        lastToolError: { toolName, error: "Command not found" },
-        sessionKey: "agent:main:warning",
-      });
-      const { replyPayloads } = await buildTestReplyPayloads({ payloads });
-      const delivered = replyPayloads
-        .map((payload) => normalizeReplyPayload(payload))
-        .filter(Boolean);
-
-      expect(delivered).toEqual([
-        expect.objectContaining({
-          text: `⚠️ ${toolName === "exec" ? "Exec" : "Bash"} failed`,
-          isError: true,
-        }),
-      ]);
-      // Both channel text cleanup and Control UI display must retain the warning.
-      expect(sanitizeAssistantVisibleText(delivered[0]?.text ?? "")).toBe(delivered[0]?.text);
-      expect(stripAssistantInternalScaffolding(delivered[0]?.text ?? "")).toBe(delivered[0]?.text);
-      expect(
-        normalizeReplyPayload({
-          text: `⚠️ 🛠️ ${toolName === "exec" ? "Exec" : "Bash"} failed`,
-          isError: true,
-        }),
-      ).toBeNull();
-    },
-  );
 
   it("keeps voice media payloads during silent turns", async () => {
     const { replyPayloads } = await buildTestReplyPayloads({

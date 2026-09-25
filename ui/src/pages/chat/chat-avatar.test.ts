@@ -14,6 +14,8 @@ import {
   renderForwardedAvatar,
 } from "./chat-avatar.ts";
 import { makeChatHost } from "./chat-host.test-support.ts";
+import type { ChatPageHost } from "./chat-state-host.ts";
+import { resolveChatAvatarUrl } from "./chat-state-route.ts";
 import { renderChatAuthorAvatar } from "./components/chat-author-avatar.ts";
 import { renderWelcomeState } from "./components/chat-welcome.ts";
 
@@ -44,6 +46,19 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("resolveChatAvatarUrl", () => {
+  it("prefers the authenticated avatar blob over persisted and protected URLs", () => {
+    const state = {
+      sessionKey: "agent:main:main",
+      chatAvatarUrl: "blob:authenticated-avatar",
+      assistantAvatar: "/avatar/main",
+      assistantAgentId: "main",
+    } as unknown as ChatPageHost;
+
+    expect(resolveChatAvatarUrl(state)).toBe("blob:authenticated-avatar");
+  });
 });
 
 describe("renderChatAvatar", () => {
@@ -208,7 +223,7 @@ describe("renderChatAvatar", () => {
     renderUser();
     const slot = container.querySelector<HTMLElement>(".chat-avatar-slot");
     const image = slot?.querySelector("img");
-    expect(slot?.classList.contains("is-fallback")).toBe(true);
+    expect(slot?.classList.contains("is-pending")).toBe(true);
     expect(image?.hasAttribute("src")).toBe(false);
     expect(slot?.querySelector(".chat-avatar--sender-initials")?.textContent?.trim()).toBe("H");
     await expect(resolveAvatarImageUrl(avatarUrl)).resolves.toBeNull();
@@ -831,7 +846,7 @@ describe("attributed sender avatars", () => {
       }),
       container,
     );
-    expect(container.querySelector(".chat-avatar-slot")?.classList.contains("is-fallback")).toBe(
+    expect(container.querySelector(".chat-avatar-slot")?.classList.contains("is-pending")).toBe(
       true,
     );
     const secondImage = await vi.waitFor(() => {
@@ -924,13 +939,16 @@ describe("attributed sender avatars", () => {
       render(renderChatAvatar("user", undefined, undefined, sender), container);
 
     renderSender();
-    expect(container.querySelector(".chat-avatar-slot")?.classList.contains("is-fallback")).toBe(
+    expect(container.querySelector(".chat-avatar-slot")?.classList.contains("is-pending")).toBe(
       true,
     );
     expect(container.querySelector(".chat-avatar--sender-initials")?.textContent?.trim()).toBe("H");
     await vi.waitFor(() => {
       expect(fetchAvatar).toHaveBeenCalledOnce();
       expect(container.querySelector(".chat-avatar-slot img")?.hasAttribute("src")).toBe(false);
+      expect(container.querySelector(".chat-avatar-slot")?.classList.contains("is-fallback")).toBe(
+        true,
+      );
     });
     expect(fetchAvatar).toHaveBeenCalledWith(
       `${gatewayOrigin}/api/users/${sender.id}/avatar`,

@@ -1,4 +1,3 @@
-// Covers current plugin metadata snapshot generation.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,8 +22,19 @@ import { withPluginInstallRoots } from "./install-root-context.js";
 import * as installedPluginIndexPolicy from "./installed-plugin-index-policy.js";
 import { writePersistedInstalledPluginIndexSync } from "./installed-plugin-index-store-write.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
+import {
+  bindPluginMetadataSnapshotCache,
+  createPluginCache,
+  invalidatePluginCacheMetadata,
+  withPluginCache,
+} from "./plugin-cache.js";
 import * as pluginControlPlaneContext from "./plugin-control-plane-context.js";
-import { clearPluginMetadataLifecycleCaches } from "./plugin-metadata-lifecycle.js";
+import {
+  clearPluginMetadataLifecycleCaches,
+  retainGatewayPluginMetadata,
+} from "./plugin-metadata-lifecycle.js";
+// Covers current plugin metadata snapshot generation.
+import { buildPluginMetadataProviderFacts } from "./plugin-metadata-provider-facts.js";
 import {
   restorePluginMetadataSnapshot,
   type PluginMetadataSnapshot,
@@ -104,6 +114,8 @@ function createSnapshot(
       setupProviders: new Map(),
       commandAliases: new Map(),
       contracts: new Map(),
+      providerAuthContributions:
+        buildPluginMetadataProviderFacts(plugins).providerAuthContributions,
       modelIdNormalizationPolicies: collectManifestModelIdNormalizationPolicies(plugins),
     },
     metrics: {
@@ -425,6 +437,43 @@ describe("current plugin metadata snapshot", () => {
       },
       { config: outerConfig },
     );
+  });
+
+  it("retains immutable inventory fingerprints with their owner across caller scopes", async () => {
+    const config = { plugins: { allow: ["source"] } };
+    const compatible = { plugins: { allow: ["runtime"] } };
+    await using owner = createPluginCache();
+    const snapshot = withPluginCache(owner, () =>
+      restorePluginMetadataSnapshot(createSnapshot({ config })),
+    );
+    const enterScope = () =>
+      withPluginMetadataSnapshotScope(
+        snapshot,
+        () => {
+          expect(getCurrentPluginMetadataSnapshot({ config })).toBe(snapshot);
+          expect(getCurrentPluginMetadataSnapshot({ config: compatible })).toBe(snapshot);
+        },
+        { config, compatibleConfigs: [compatible] },
+      );
+
+    await using firstCaller = createPluginCache();
+    withPluginCache(firstCaller, enterScope);
+    const facts = owner.metadata.indexFacts.get(snapshot.index);
+    expect(facts?.fingerprint).toEqual(expect.any(String));
+    expect(firstCaller.metadata.indexFacts.has(snapshot.index)).toBe(false);
+
+    await using secondCaller = createPluginCache();
+    withPluginCache(secondCaller, enterScope);
+    expect(owner.metadata.indexFacts.get(snapshot.index)).toBe(facts);
+    expect(secondCaller.metadata.indexFacts.has(snapshot.index)).toBe(false);
+
+    invalidatePluginCacheMetadata(owner);
+    expect(owner.metadata.indexFacts.has(snapshot.index)).toBe(false);
+    withPluginCache(secondCaller, enterScope);
+    const refreshed = owner.metadata.indexFacts.get(snapshot.index);
+    expect(refreshed).not.toBe(facts);
+    expect(refreshed?.fingerprint).toBe(facts?.fingerprint);
+    expect(secondCaller.metadata.indexFacts.has(snapshot.index)).toBe(false);
   });
 
   it("supports compatible config identities within an owner-prepared scope", () => {
@@ -821,6 +870,53 @@ describe("current plugin metadata snapshot", () => {
     clearPluginMetadataLifecycleCaches();
 
     expect(getCurrentPluginMetadataSnapshot({ config })).toBeUndefined();
+  });
+
+  it.each([false, true])(
+    "clearPluginMetadataLifecycleCaches revokes nested operation scopes across awaits (Gateway active: %s)",
+    async (gatewayActive) => {
+      const boot = createSnapshot();
+      const owner = gatewayActive ? retainGatewayPluginMetadata() : undefined;
+      if (owner) {
+        owner.publish(boot);
+        setGatewayPluginMetadataSnapshot(boot);
+      }
+      try {
+        await using outer = createPluginCache();
+        await using inner = createPluginCache();
+        const before = createSnapshot({ normalizationAlias: "before-install" });
+        const nested = createSnapshot({ normalizationAlias: "nested-before-install" });
+        const after = createSnapshot({ normalizationAlias: "after-install" });
+        bindPluginMetadataSnapshotCache(before, outer);
+        bindPluginMetadataSnapshotCache(nested, inner);
+        bindPluginMetadataSnapshotCache(after, outer);
+        await withPluginMetadataSnapshotScope(before, async () => {
+          await withPluginMetadataSnapshotScope(nested, async () => {
+            await Promise.resolve();
+            clearPluginMetadataLifecycleCaches();
+            expect(getCurrentPluginMetadataSnapshot()).toBeUndefined();
+          });
+          expect(getCurrentPluginMetadataSnapshot()).toBeUndefined();
+          withPluginMetadataSnapshotScope(after, () => {
+            expect(getCurrentPluginMetadataSnapshot()).toBe(after);
+          });
+          expect(getCurrentPluginMetadataSnapshot()).toBeUndefined();
+        });
+        if (owner) {
+          expect(getCurrentPluginMetadataSnapshot()).toBe(boot);
+        }
+      } finally {
+        await owner?.close();
+      }
+    },
+  );
+
+  it("clearPluginMetadataLifecycleCaches preserves an admitted runtime generation", () => {
+    const snapshot = createSnapshot();
+    withPluginRuntimeGenerationScope({ metadataSnapshot: snapshot }, () => {
+      clearPluginMetadataLifecycleCaches();
+      expect(getCurrentPluginMetadataSnapshot()).toBe(snapshot);
+    });
   });
 
   it("keeps derived registry snapshots as the current process snapshot", () => {

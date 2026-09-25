@@ -35,8 +35,9 @@ it.each([
     const home = path.join(root, "home");
     const temporaryRoot = path.join(root, "transfers");
     await fs.mkdir(workspaceDir);
-    const exec = async (argv: string[]) => {
+    const exec = async (argv: string[], input?: string | Uint8Array) => {
       const result = await runCommandWithTimeout(argv, {
+        input,
         cwd: workspaceDir,
         timeoutMs: 10_000,
         baseEnv: {
@@ -95,7 +96,7 @@ it.each([
         "refs/openclaw/worker-result-candidates/",
       ]);
     const manifests = path.join(home, ".openclaw-worker", "manifests");
-    await fs.mkdir(manifests, { recursive: true });
+    await fs.mkdir(manifests, { recursive: true, mode: 0o700 });
     await fs.writeFile(path.join(manifests, `${base.manifestRef.slice(7)}.json`), base.rawManifest);
     await fs.writeFile(path.join(workspaceDir, "result.txt"), "checkpoint edit\n");
     const owner = new AbortController();
@@ -171,7 +172,7 @@ it.each([
       workspaceTransfer: service,
       runWorkspaceCommand: async (command) => {
         if (!command.transfer) {
-          return await exec([...command.argv]);
+          return await exec([...command.argv], command.input);
         }
         const publication =
           command.transfer.direction === "upload" &&
@@ -220,6 +221,9 @@ it.each([
       WorkerWorkspaceReconcileRequest["source"],
       { kind: "repository" }
     >["prepareCheckpoint"] = async (payload) => {
+      if (!failPublication) {
+        expect(payload.publicationStagingRoot).toBeDefined();
+      }
       expect(await fs.readFile(path.join(payload.stagingRoot, "result.txt"), "utf8")).toBe(
         "checkpoint edit\n",
       );

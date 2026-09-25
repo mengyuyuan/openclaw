@@ -6,6 +6,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
 import { resetSecretRedactionRegistryForTest } from "../logging/secret-redaction-registry.test-support.js";
 import { setTestEnvValue } from "../test-utils/env.js";
+import { acquireTestPortBlock } from "../test-utils/port-claims.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import {
   createGatewayConfigPath,
@@ -13,11 +14,7 @@ import {
   resetGatewayTestState,
   setupGatewayTempHome,
 } from "./gateway.test-support.js";
-import {
-  disconnectGatewayClient,
-  getGatewayE2ePortBlock,
-  startGatewayWithClient,
-} from "./test-helpers.e2e.js";
+import { disconnectGatewayClient, startGatewayWithClient } from "./test-helpers.e2e.js";
 import { buildMockOpenAiResponsesProvider } from "./test-openai-responses-model.js";
 
 type TextMessage = {
@@ -95,14 +92,16 @@ describe("registered Control UI chat redaction", () => {
       gateway: { auth: { mode: "token", token } },
       hooks: { enabled: false },
     } satisfies OpenClawConfig;
-    const port = await getGatewayE2ePortBlock();
+    const configPath = await createGatewayConfigPath(home.tempHome);
+    const portClaim = await acquireTestPortBlock({ offsets: [0, 1, 2, 3, 4] });
+    const { port } = portClaim;
     gateway = await startGatewayWithClient({
       cfg,
-      port,
+      portClaim,
       clientName: GATEWAY_CLIENT_NAMES.CONTROL_UI,
       mode: GATEWAY_CLIENT_MODES.WEBCHAT,
       origin: `http://127.0.0.1:${port}`,
-      configPath: await createGatewayConfigPath(home.tempHome),
+      configPath,
       token,
       clientDisplayName: "chat-redaction-test",
     });
@@ -182,6 +181,10 @@ describe("registered Control UI chat redaction", () => {
     `https://x.com/@user/status/${secret}`,
     `data:application/octet-stream;base64,AAAA/${secret}@`,
     `https://example.test:8080/path-${secret}`,
+    `https://example.test/${secret}@latest`,
+    `https://example.test/path-${secret}?foo=@`,
+    JSON.stringify([`${publicUrl}?safe=1`, publicUrl]),
+    JSON.stringify(JSON.stringify([`${publicUrl}?safe=1`, publicUrl])),
   ])(
     "chat.send preserves %s in chat.history and recorded model input",
     async (url) => {
@@ -220,9 +223,9 @@ describe("registered Control UI chat redaction", () => {
       `https://example.test/#https://example.test/path-${masked}`,
     ],
     [
-      "at-sign beyond query cutoff",
-      `https://example.test/path-${secret}?foo=@`,
-      `https://example.test/path-${masked}?foo=@`,
+      "URL in parenthesized query value",
+      `https://example.test/?next=(https://example.test/path-${secret})`,
+      `https://example.test/?next=(https://example.test/path-${masked})`,
     ],
     ...[")", "]", "}", "|", "\x60", "\x27", '"', "<", ">"].map((punctuation) => [
       `userinfo before ${punctuation}`,

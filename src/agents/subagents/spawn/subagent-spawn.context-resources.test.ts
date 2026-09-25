@@ -12,6 +12,7 @@ import { PluginRegistryInspectionResources } from "../../../plugins/registry-ins
 import { retireInspectionInstances } from "../../../plugins/registry-inspection.test-support.js";
 import { withPluginRuntimeRegistryScope } from "../../../plugins/runtime/gateway-request-scope.js";
 import { AsyncWorkScope } from "../../../shared/async-work-scope.js";
+import type { SubagentRegistrationScope } from "../registry/subagent-registry.types.js";
 import {
   loadSubagentSpawnModuleForTest,
   createSubagentSpawnTestConfig,
@@ -249,20 +250,39 @@ describe("spawn context-engine resource custody", () => {
       return { rollback };
     });
     resolveEngine.mockImplementation(() => fixture.resolve());
-    registerRun.mockImplementation(({ runId }: { runId: string }) => {
-      expect(scheduler.removeQueuedSwarmRun(runId)).toBe(true);
-    });
+    const settleFailedLaunch = vi.fn(async () => {});
+    const cancelledScope = {
+      waitForClaim: () => undefined,
+      waitForRetirementPublication: () => undefined,
+      canLaunch: () => false,
+      canCleanupSession: () => true,
+      canAcceptLaunch: () => true,
+      canRetireReservation: () => false,
+      settleFailedLaunch,
+    } satisfies SubagentRegistrationScope;
+    registerRun.mockImplementation(
+      async (
+        { runId }: { runId: string },
+        options: { retainOwnership?: (scope: SubagentRegistrationScope) => void },
+      ) => {
+        options.retainOwnership?.(cancelledScope);
+        expect(scheduler.removeQueuedSwarmRun(runId)).toBe(true);
+      },
+    );
     try {
       await expect(
         spawn(
           { task: "withdrawn child", collect: true, groupId: "withdrawn-group" },
           { agentSessionKey: "main" },
         ),
-      ).rejects.toThrow("swarm scheduler reservation missing");
+      ).resolves.toMatchObject({ status: "accepted" });
+      expect(callGateway.mock.calls.some(([request]) => request.method === "agent")).toBe(false);
+      expect(settleFailedLaunch).not.toHaveBeenCalled();
       expect(childPrepared).toBe(false);
       expect(rollback).toHaveBeenCalledTimes(1);
       expect(fixture.engineDisposal).toHaveBeenCalledTimes(1);
       expect(fixture.retired).toHaveBeenCalledTimes(1);
+      expect(fixture.database.isOpen).toBe(false);
     } finally {
       await fixture.cleanup();
     }
@@ -276,6 +296,9 @@ describe("spawn context-engine resource custody", () => {
     "draining",
     "retired-draining",
     "withdrawal",
+    "shutdown",
+    "shutdown-disposal-failure",
+    "shutdown-draining",
   ] as const)("keeps queued preparation alive until %s finishes", async (mode) => {
     const blockerStarted = createDeferred();
     const retryStarted = createDeferred();
@@ -299,7 +322,7 @@ describe("spawn context-engine resource custody", () => {
         if (mode === "withdrawal") {
           await disposalGate.promise;
         }
-        if (mode === "disposal-failure") {
+        if (mode === "disposal-failure" || mode === "shutdown-disposal-failure") {
           throw new Error("engine cleanup failed");
         }
       },
@@ -316,19 +339,15 @@ describe("spawn context-engine resource custody", () => {
         if (mode === "failure" || mode === "rollback-failure" || mode === "disposal-failure") {
           throw new Error("launch failed");
         }
-        if (mode === "retired-draining") {
+        if (mode === "retired-draining" || mode === "shutdown-draining") {
           retryStarted.resolve();
           await retryGate.promise;
           fixture.read();
           throw new GatewayDrainingError();
         }
         if (mode === "draining") {
-          if (launches === 1) {
-            throw new GatewayDrainingError();
-          }
           retryStarted.resolve();
-          await retryGate.promise;
-          fixture.read();
+          throw new GatewayDrainingError();
         }
         return { runId: request.params?.idempotencyKey, status: "accepted" };
       },
@@ -343,6 +362,7 @@ describe("spawn context-engine resource custody", () => {
     });
     await blockerStarted.promise;
     let queuedRunId: string | undefined;
+    let closing: Promise<void> | undefined;
     try {
       const result = await spawn(
         { task: "synthetic queued child", collect: true, groupId: "resource-group" },
@@ -364,13 +384,22 @@ describe("spawn context-engine resource custody", () => {
         expect(fixture.database.isOpen).toBe(true);
         disposalGate.resolve();
         await release;
+      } else if (mode === "shutdown" || mode === "shutdown-disposal-failure") {
+        closing = scheduler.closeSwarmScheduler();
+        if (mode === "shutdown-disposal-failure") {
+          await expect(closing).rejects.toThrow("Swarm launch cleanup failed");
+        } else {
+          await closing;
+        }
+        expect(launches).toBe(0);
+        expect(settleLaunchFailure).not.toHaveBeenCalled();
       } else {
         if (mode === "retired-draining") {
           launchWork.run(() => scheduler.releaseSwarmRun("blocker"));
         } else {
           scheduler.releaseSwarmRun("blocker");
         }
-        if (mode === "draining" || mode === "retired-draining") {
+        if (mode === "draining" || mode === "retired-draining" || mode === "shutdown-draining") {
           await retryStarted.promise;
           expect(fixture.database.isOpen).toBe(true);
           expect(rollback).not.toHaveBeenCalled();
@@ -378,8 +407,24 @@ describe("spawn context-engine resource custody", () => {
             await launchWork.drain();
             expect(scheduler.releaseSwarmRun(result.runId!)).toBe(true);
             expect(fixture.database.isOpen).toBe(true);
+          } else if (mode === "shutdown-draining") {
+            let closed = false;
+            closing = scheduler.closeSwarmScheduler().finally(() => {
+              closed = true;
+            });
+            await Promise.resolve();
+            expect(closed).toBe(false);
+            expect(fixture.database.isOpen).toBe(true);
+          } else if (mode === "draining") {
+            await new Promise<void>((resolve) => {
+              setImmediate(resolve);
+            });
+            expect(launches).toBe(1);
+            expect(settleLaunchFailure).not.toHaveBeenCalled();
+            closing = scheduler.closeSwarmScheduler();
           }
           retryGate.resolve();
+          await closing;
         }
         await vi.waitFor(() => expect(fixture.retired).toHaveBeenCalledTimes(1));
       }
@@ -404,6 +449,7 @@ describe("spawn context-engine resource custody", () => {
     } finally {
       retryGate.resolve();
       disposalGate.resolve();
+      await closing?.catch(() => {});
       if (queuedRunId) {
         scheduler.removeQueuedSwarmRun(queuedRunId);
       }

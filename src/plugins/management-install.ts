@@ -37,7 +37,7 @@ import type { InstallSafetyOverrides } from "./install-security-scan.js";
 import type { InstallPolicyWarningDetails } from "./install-security-scan.types.js";
 import {
   requestDeferredPluginInstall,
-  resolvePluginInstallTransaction,
+  takePluginInstallTransaction,
 } from "./install-transaction.js";
 import {
   isUnavailableNpmTarget,
@@ -224,6 +224,7 @@ async function resolveOfficialManagedInstallSpec(params: {
 type ManagedPluginSourceInstallParams = {
   request: ManagedPluginSourceInstallRequest;
   snapshot: ConfigSnapshotForInstallPersist;
+  enable?: boolean;
   env?: NodeJS.ProcessEnv;
   logger?: PluginInstallLogger & { terminalLinks?: boolean };
   safetyOverrides?: InstallSafetyOverrides;
@@ -240,7 +241,7 @@ type ManagedPluginSourceInstallParams = {
 
 export type ManagedPluginInstallOptions = Omit<
   ManagedPluginSourceInstallParams,
-  "request" | "snapshot" | "acknowledgeCapabilities"
+  "request" | "snapshot" | "acknowledgeCapabilities" | "enable"
 > & {
   /** The enclosing Claw coordinator owns its package lease and adoption record. */
   clawManaged?: boolean;
@@ -431,7 +432,7 @@ async function installResolvedManagedPluginSource(
         mode: request.mode ?? "install",
       });
     }
-    const transaction = resolvePluginInstallTransaction(installed);
+    const transaction = takePluginInstallTransaction(installed);
     if (completed.expectedPluginId && installed.pluginId !== completed.expectedPluginId) {
       await transaction?.rollback();
       return {

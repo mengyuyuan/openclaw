@@ -5,11 +5,25 @@ import { stableStringify } from "@openclaw/normalization-core/stable-stringify";
 import {
   hasDisplayableSessionMessage,
   readSessionMessageDisplayContent,
+  projectSessionTerminalReplyMessage,
 } from "./session-projection-message-content.js";
 import {
   readSessionMessageIdentity,
+  sameAssistantPersistenceReceipt,
+  sameTranscriptIdentity,
   type SessionMessageIdentity,
 } from "./session-projection-message-identity.js";
+
+/**
+ * The class of rows the #148297 relaxation newly admits as finals: persisted
+ * with the run's terminal tool stop reason while carrying no tool-call
+ * content. Both adoption directions and every position rule scope to this
+ * predicate, so pre-existing match semantics stay untouched.
+ */
+export function isToolUsePersistedFinalRow(message: unknown): boolean {
+  const record = readRecord(message);
+  return record?.["stopReason"] === "toolUse" && !isSessionProjectionToolContinuation(message);
+}
 
 type TerminalProjectionEntry = {
   message: unknown;
@@ -24,6 +38,25 @@ type TerminalProjectionRun = {
   acceptedFinalMessageIdentities?: readonly string[];
 };
 
+/** Tool-bearing assistant rows are continuations even without a tool stop reason. */
+export function isSessionProjectionToolContinuation(message: unknown): boolean {
+  const record = readRecord(message);
+  if (
+    Array.isArray(record?.content) &&
+    record.content.some((block) => {
+      const type = readRecord(block)?.type;
+      return type === "toolCall" || type === "toolUse" || type === "functionCall";
+    })
+  ) {
+    return true;
+  }
+  // A tool stop reason alone marks a continuation only when the row carries no
+  // displayable text: a run's selected final answer is persisted with the
+  // run's terminal stop reason even when the row itself is pure text, and such
+  // a final must still reconcile with its unkeyed live projection (#148297).
+  return record?.stopReason === "toolUse" && !hasDisplayableSessionMessage(message);
+}
+
 function readPersistedFinalIdentity(message: unknown): string | null {
   const identity = readSessionMessageIdentity(message);
   if (identity?.externalSource) {
@@ -34,6 +67,9 @@ function readPersistedFinalIdentity(message: unknown): string | null {
   }
   if (identity?.sequence !== null && identity?.sequence !== undefined) {
     return `seq:${identity.role}:${identity.sequence}`;
+  }
+  if (identity?.role === "assistant" && !identity.isImported && identity.idempotencyKey) {
+    return `key:assistant:${identity.idempotencyKey}`;
   }
   return null;
 }
@@ -57,6 +93,9 @@ function hasCompatiblePersistedFinalIdentity(currentMessage: unknown, incomingMe
       current.sequence === incoming.sequence
     );
   }
+  if (sameAssistantPersistenceReceipt(current, incoming)) {
+    return true;
+  }
   if (current.id && incoming.id) {
     return current.id === incoming.id;
   }
@@ -67,13 +106,14 @@ function hasCompatiblePersistedFinalIdentity(currentMessage: unknown, incomingMe
   );
 }
 
-function readFinalContentIdentity(message: unknown): string | null {
-  const display = readSessionMessageDisplayContent(message);
+export function readFinalContentIdentity(message: unknown): string | null {
+  const terminalMessage = projectSessionTerminalReplyMessage(message);
+  const display = readSessionMessageDisplayContent(terminalMessage);
   if (!display.text && !display.hasNonText) {
     return null;
   }
   const identity = readSessionMessageIdentity(message);
-  const record = readRecord(message);
+  const record = readRecord(terminalMessage);
   const metadata = readRecord(record?.["__openclaw"]);
   try {
     return `content:${stableStringify([
@@ -106,22 +146,28 @@ function hasTerminalStopReason(message: unknown): boolean {
 }
 
 /**
- * Completed-run snapshot-context check over one snapshot: indexes are built in a
- * single sweep and reused across every candidate row of a reconciliation pass.
+ * Shared position checks over one snapshot: indexes are built in a single sweep
+ * and reused across every candidate row of a reconciliation pass. Snapshot
+ * promotion and live replay reconciliation both scope to these rules.
  */
-function createCompletedRunSnapshotContextCheck(
+type RunSnapshotChecks = {
+  hasCompletedRunSnapshotContext: (entry: TerminalProjectionEntry) => boolean;
+  isLastSameRunAssistantRow: (entry: TerminalProjectionEntry) => boolean;
+};
+
+function createRunSnapshotChecks(
   snapshot: readonly TerminalProjectionEntry[],
   runId: string | null,
-): (entry: TerminalProjectionEntry) => boolean {
+): RunSnapshotChecks {
   let snapshotIndexes: Map<TerminalProjectionEntry, number> | undefined;
   let firstUserIndex = -1;
   let lastAssistantIndex = -1;
-  return (entry: TerminalProjectionEntry): boolean => {
-    if (!runId || entry.identity?.runId !== runId) {
-      return false;
+  const ensureRunIndexes = (): Map<TerminalProjectionEntry, number> => {
+    if (snapshotIndexes) {
+      return snapshotIndexes;
     }
-    if (!snapshotIndexes) {
-      const indexes = new Map<TerminalProjectionEntry, number>();
+    const indexes = new Map<TerminalProjectionEntry, number>();
+    if (runId) {
       snapshot.forEach((candidate, index) => {
         if (candidate.identity?.runId === runId) {
           // Keep indexOf's first-occurrence identity when a snapshot repeats an entry.
@@ -135,15 +181,35 @@ function createCompletedRunSnapshotContextCheck(
           }
         }
       });
-      snapshotIndexes = indexes;
     }
-    const entryIndex = snapshotIndexes.get(entry);
-    return (
-      entryIndex !== undefined &&
-      firstUserIndex >= 0 &&
-      firstUserIndex < entryIndex &&
-      lastAssistantIndex <= entryIndex
-    );
+    snapshotIndexes = indexes;
+    return indexes;
+  };
+  const readSameRunIndex = (entry: TerminalProjectionEntry): number | undefined => {
+    if (!runId || entry.identity?.runId !== runId) {
+      return undefined;
+    }
+    return ensureRunIndexes().get(entry);
+  };
+  return {
+    hasCompletedRunSnapshotContext: (entry: TerminalProjectionEntry): boolean => {
+      const entryIndex = readSameRunIndex(entry);
+      return (
+        entryIndex !== undefined &&
+        firstUserIndex >= 0 &&
+        firstUserIndex < entryIndex &&
+        lastAssistantIndex <= entryIndex
+      );
+    },
+    // A toolUse-persisted row can only be the run's selected final when no later
+    // same-run assistant row exists in the snapshot: a following assistant or
+    // tool row proves the run continued past it, so the live terminal must stay.
+    isLastSameRunAssistantRow: (entry: TerminalProjectionEntry): boolean => {
+      const entryIndex = readSameRunIndex(entry);
+      return (
+        entryIndex !== undefined && lastAssistantIndex >= 0 && entryIndex >= lastAssistantIndex
+      );
+    },
   };
 }
 
@@ -151,13 +217,21 @@ function createCompletedRunSnapshotContextCheck(
 function hasTerminalProjectionEvidence(
   entry: TerminalProjectionEntry,
   runId: string | null,
-  hasCompletedRunSnapshotContext: (entry: TerminalProjectionEntry) => boolean,
+  checks: RunSnapshotChecks,
 ): boolean {
   const metadata = readRecord(readRecord(entry.message)?.["__openclaw"]);
   return (
     metadata?.runTerminal === true ||
-    (entry.identity?.runId === runId && hasTerminalStopReason(entry.message)) ||
-    hasCompletedRunSnapshotContext(entry)
+    (entry.identity?.runId === runId &&
+      (hasTerminalStopReason(entry.message) ||
+        // A row persisted with the run's terminal tool stop reason and no
+        // tool-call content is the run's selected final; it must reconcile
+        // with its unkeyed live projection (#148297). Unmarked rows stay
+        // separate — partial history must not adopt the terminal — and the
+        // row must be the run's last assistant row in the snapshot, since
+        // a later same-run row proves the run continued past it.
+        (isToolUsePersistedFinalRow(entry.message) && checks.isLastSameRunAssistantRow(entry)))) ||
+    checks.hasCompletedRunSnapshotContext(entry)
   );
 }
 
@@ -250,10 +324,10 @@ function findUniqueTerminalContentMatch<T extends TerminalProjectionEntry>(
   snapshot: readonly TerminalProjectionEntry[],
   runId: string | null,
 ): T | null {
-  const hasCompletedRunSnapshotContext = createCompletedRunSnapshotContextCheck(snapshot, runId);
+  const checks = createRunSnapshotChecks(snapshot, runId);
   const candidates = matches.filter(
     (entry) =>
-      hasTerminalProjectionEvidence(entry, runId, hasCompletedRunSnapshotContext) &&
+      hasTerminalProjectionEvidence(entry, runId, checks) &&
       readFinalContentIdentity(entry.message) === content,
   );
   return candidates.length === 1 ? (candidates[0] ?? null) : null;
@@ -316,6 +390,15 @@ export function withTentativeRecovery<TRun extends { message?: unknown; status: 
   return { ...run, inferredSnapshotTerminal: { entry, matchedIdentity: matched.identity } };
 }
 
+/** Compose a run's tentative terminal-recovery record from a checked match. */
+export function withInferredTerminal<TRun extends { message?: unknown; status: string }>(
+  run: TRun,
+  entry: TerminalProjectionEntry,
+  matchedIdentity: SessionMessageIdentity,
+): TRun {
+  return { ...run, inferredSnapshotTerminal: { entry, matchedIdentity } };
+}
+
 /**
  * Check whether a live unsequenced assistant reply is a distinct later reply of
  * the run rather than its immutable first final. Tentative recovery cannot
@@ -351,4 +434,57 @@ export function shouldKeepLaterFinalVisible(
   run: TerminalProjectionRun | undefined,
 ): boolean {
   return !hasExplicitTerminalEvidence(matched) && isDistinctLaterLiveFinal(entry, run);
+}
+
+/** A single candidate still goes through the ambiguous-replay evidence check. */
+export function findAdoptableMatch<T extends TerminalProjectionEntry>(
+  matches: readonly T[],
+): T | undefined {
+  const single = matches.length === 1 ? matches[0] : undefined;
+  return single && !isSessionProjectionToolContinuation(single.message) ? single : undefined;
+}
+
+/** The adoption target for a live projection: exact identity, then replay selection. */
+export function findLiveTranscriptTarget<T extends TerminalProjectionEntry>(
+  matches: readonly T[],
+  incoming: TerminalProjectionEntry,
+  snapshot: readonly TerminalProjectionEntry[],
+): T | null {
+  const direct = matches.find((entry) => sameTranscriptIdentity(entry.identity, incoming.identity));
+  return (
+    direct ??
+    findAdoptableMatch(matches) ??
+    findUniqueLiveTerminalMatch(incoming, matches, snapshot)
+  );
+}
+
+/** A tool continuation can neither be adopted as nor replace an unkeyed live final. */
+export function isToolContinuationOwner(
+  tool: TerminalProjectionEntry,
+  target: TerminalProjectionEntry,
+): boolean {
+  return isSessionProjectionToolContinuation(tool.message) && !target.identity?.id;
+}
+
+/**
+ * Resolve how an unkeyed live terminal projection is adopted by a durable row:
+ * persistence receipts suppress directly (no inference needed), position
+ * matches keep a recovery record, and a later distinct final stays visible.
+ */
+export function resolveLiveAdoption<TRun extends { message?: unknown; status: string }>(
+  entry: TerminalProjectionEntry,
+  matched: TerminalProjectionEntry,
+  runs: Readonly<Record<string, TRun>>,
+): { runId: string | null; recovery: TRun | null; keepVisible: boolean } {
+  const runId = entry.identity?.runId ?? null;
+  if (sameAssistantPersistenceReceipt(matched.identity, entry.identity)) {
+    return { runId, recovery: null, keepVisible: false };
+  }
+  const recovery = withTentativeRecovery(runId ? runs[runId] : undefined, entry, matched);
+  return {
+    runId,
+    recovery,
+    keepVisible:
+      !recovery && shouldKeepLaterFinalVisible(entry, matched, runId ? runs[runId] : undefined),
+  };
 }

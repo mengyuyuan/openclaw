@@ -124,6 +124,9 @@ function sourceArtifacts(paths: string[], allowReadMarks: string[] = []): unknow
 describe("schema preflight source artifacts", () => {
   it("retains the source-reader lock tolerance beyond the runtime busy timeout", async () => {
     const root = tempDirs.make("openclaw-header-lock-tolerance-");
+    const env = { OPENCLAW_STATE_DIR: path.join(root, "active-state") };
+    openOpenClawStateDatabase({ env });
+    closeOpenClawStateDatabaseForTest();
     const pathname = path.join(root, "agent.sqlite");
     const writer = new (requireNodeSqlite().DatabaseSync)(pathname);
     writer.exec(`
@@ -140,7 +143,7 @@ describe("schema preflight source artifacts", () => {
     }, 8_000);
     try {
       const result = await preflightOpenClawDatabaseSchemas({
-        env: { OPENCLAW_STATE_DIR: path.join(root, "absent-state") },
+        env,
         supportedVersions,
         configuredAgentDatabaseCandidatePaths: [pathname],
       });
@@ -156,11 +159,19 @@ describe("schema preflight source artifacts", () => {
     }
   }, 20_000);
 
-  it.each([0, 8 * 1024 * 1024])(
-    "reads fresh WAL metadata without copying %i bytes of unrelated payload",
-    async (payloadBytes) => {
+  it.each([
+    { payloadBytes: 0, admission: false },
+    { payloadBytes: 8 * 1024 * 1024, admission: false },
+    { payloadBytes: 8 * 1024 * 1024, admission: true },
+  ])(
+    "reads fresh WAL metadata without copying $payloadBytes bytes of unrelated payload (admission=$admission)",
+    async ({ payloadBytes, admission }) => {
       const root = tempDirs.make("openclaw-header-preflight-");
-      const pathname = path.join(root, "agent.sqlite");
+      const env = { OPENCLAW_STATE_DIR: path.join(root, "active-state") };
+      openOpenClawStateDatabase({ env });
+      closeOpenClawStateDatabaseForTest();
+      const pathname = path.join(root, "agents", "main", "agent", "openclaw-agent.sqlite");
+      fs.mkdirSync(path.dirname(pathname), { recursive: true });
       const preload = path.join(root, "no-backup.cjs");
       fs.writeFileSync(
         preload,
@@ -170,8 +181,8 @@ describe("schema preflight source artifacts", () => {
       writer.exec(`
         PRAGMA journal_mode = WAL;
         PRAGMA wal_autocheckpoint = 0;
-        CREATE TABLE schema_meta (meta_key TEXT PRIMARY KEY, app_version TEXT);
-        INSERT INTO schema_meta VALUES ('primary', 'original');
+        CREATE TABLE schema_meta (meta_key TEXT PRIMARY KEY, app_version TEXT, role TEXT, agent_id TEXT, schema_version INTEGER);
+        INSERT INTO schema_meta VALUES ('primary', 'original', 'agent', 'main', ${supportedVersions.agent});
         CREATE TABLE payload (data BLOB);
         INSERT INTO payload VALUES (zeroblob(${payloadBytes}));
         PRAGMA user_version = ${supportedVersions.agent};
@@ -182,27 +193,44 @@ describe("schema preflight source artifacts", () => {
       }
       try {
         for (const increment of [1, 2]) {
-          const foundVersion = supportedVersions.agent + increment;
+          const foundVersion = supportedVersions.agent + (admission ? 0 : increment);
           writer.exec(`BEGIN IMMEDIATE; PRAGMA user_version = ${foundVersion};`);
-          writer.prepare("UPDATE schema_meta SET app_version = ?").run(`writer-${increment}`);
+          writer
+            .prepare("UPDATE schema_meta SET app_version = ?, agent_id = ?")
+            .run(`writer-${increment}`, increment === 1 ? "other" : "main");
           writer.exec("COMMIT;");
           const before = sourceArtifacts([pathname], [pathname]);
           const result = await preflightOpenClawDatabaseSchemas({
-            env: { OPENCLAW_STATE_DIR: path.join(root, "absent-state") },
+            env,
             supportedVersions,
             configuredAgentDatabaseCandidatePaths: [pathname],
+            ...(admission ? { agentAdmissionConfig: { agents: { entries: { main: {} } } } } : {}),
           });
           expect(result).toEqual({
-            incompatible: [
-              {
-                kind: "agent",
-                path: pathname,
-                foundVersion,
-                supportedVersion: supportedVersions.agent,
-                writerAppVersion: `writer-${increment}`,
-              },
-            ],
+            incompatible: admission
+              ? []
+              : [
+                  {
+                    kind: "agent",
+                    path: pathname,
+                    foundVersion,
+                    supportedVersion: supportedVersions.agent,
+                    writerAppVersion: `writer-${increment}`,
+                  },
+                ],
             indeterminate: [],
+            ...(admission && increment === 1
+              ? {
+                  agentRefusals: [
+                    expect.objectContaining({
+                      agentId: "main",
+                      paths: [pathname],
+                      embeddedOwnerId: "other",
+                      code: "agent-database-ownership-mismatch",
+                    }),
+                  ],
+                }
+              : {}),
           });
           expect(sourceArtifacts([pathname], [pathname])).toEqual(before);
         }
@@ -306,6 +334,8 @@ describe("schema preflight source artifacts", () => {
       expect(fs.realpathSync.native(locator)).toBe(fs.realpathSync.native(fixture.worker.path));
       expect(fs.realpathSync(locator)).toBe(fs.realpathSync.native(lexicalPath));
       const callerEnv = { OPENCLAW_STATE_DIR: tempDirs.make("openclaw-preflight-caller-") };
+      const callerStatePath = openOpenClawStateDatabase({ env: callerEnv }).path;
+      closeOpenClawStateDatabaseForTest();
       const contexts = [
         { env: fixture.env, config: {} },
         { env: callerEnv, config: { session: { store: lexicalPath } } },
@@ -313,6 +343,7 @@ describe("schema preflight source artifacts", () => {
       ];
       const paths = [
         ...fixture.paths,
+        callerStatePath,
         lexicalPath,
         path.join(callerEnv.OPENCLAW_STATE_DIR, "absent.sqlite"),
       ];
@@ -342,7 +373,7 @@ describe("schema preflight source artifacts", () => {
     const paths = [...fixture.paths, configPath];
     const before = sourceArtifacts(paths);
     await expect(checkTargetDatabaseSchemas(supportedVersions, fixture.env)).rejects.toMatchObject({
-      reason: "database-schema-preflight",
+      reason: "invalid-config",
     });
     expect(
       await checkTargetDatabaseSchemasForContexts(undefined, [{ env: fixture.env, config: {} }]),
@@ -482,6 +513,9 @@ describe("schema preflight source artifacts", () => {
       expect(sourceArtifacts(fixture.paths, allowReadMarks)).toEqual(before);
     } finally {
       clearImmediate(immediate);
+      fixture.state.db.exec(`PRAGMA user_version = ${supportedVersions.state};`);
+      fixture.main.db.exec(`PRAGMA user_version = ${supportedVersions.agent};`);
+      fixture.worker.db.exec(`PRAGMA user_version = ${supportedVersions.agent};`);
     }
   });
 
@@ -552,6 +586,13 @@ describe("schema preflight source artifacts", () => {
         const walBefore = fs.readFileSync(`${fixture.main.path}-wal`);
         for (const inspect of [
           () => preflightOpenClawDatabaseSchemas({ env: fixture.env, supportedVersions }),
+          () =>
+            preflightOpenClawDatabaseSchemas({
+              env: fixture.env,
+              supportedVersions,
+              verifyCurrentSchemaShape: true,
+              requireStartupMigrationReadiness: true,
+            }),
           () =>
             checkTargetDatabaseSchemasForContexts(supportedVersions, [
               { env: fixture.env, config: {} },
@@ -734,14 +775,15 @@ describe("schema preflight source artifacts", () => {
       vi.spyOn(snapshots, "prepareSqliteReadOnlyLocation").mockImplementation(
         async (pathname, options) => {
           const prepared = await prepare(pathname, options);
-          const cleanup = vi.fn(prepared.cleanup);
+          const cleanup = vi.fn(prepared.cleanupAsync);
           cleanups.push({ location: prepared.location, cleanup });
           return {
+            ...prepared,
             location:
               pathname === fixture[kind].path
                 ? path.join(path.dirname(prepared.location), "missing.sqlite")
                 : prepared.location,
-            cleanup,
+            cleanupAsync: cleanup,
           };
         },
       );

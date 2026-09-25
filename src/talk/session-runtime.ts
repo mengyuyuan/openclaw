@@ -4,8 +4,10 @@ import {
   buildRealtimeVoiceAgentControlSpeechMessage,
   REALTIME_VOICE_AGENT_CONTROL_FAILURE_MESSAGE,
 } from "./agent-run-control-shared.js";
+import type { InternalRealtimeVoiceProviderCapabilities } from "./provider-internal.js";
 import type {
   RealtimeVoiceBridge,
+  RealtimeVoiceAgentConsultRunner,
   RealtimeVoiceBridgeCallbacks,
   RealtimeVoiceAudioClearReason,
   RealtimeVoiceAudioFormat,
@@ -15,11 +17,11 @@ import type {
   RealtimeVoiceBridgeEvent,
   RealtimeVoiceProviderConfig,
   RealtimeVoiceResponseOutcome,
-  RealtimeVoiceRole,
   RealtimeVoiceTool,
   RealtimeVoiceToolCallEvent,
   RealtimeVoiceToolResultOptions,
 } from "./provider-types.js";
+import { resolveRealtimeVoiceBargeIn } from "./realtime-session-policy.js";
 
 /**
  * Transport-facing audio target used by realtime voice bridge sessions.
@@ -42,6 +44,7 @@ export type RealtimeVoiceMarkStrategy = "transport" | "ack-immediately" | "ignor
  */
 export type RealtimeVoiceBridgeSession = {
   bridge: RealtimeVoiceBridge;
+  readonly capabilities?: InternalRealtimeVoiceProviderCapabilities;
   acknowledgeMark(markName?: string): void;
   close(options?: RealtimeVoiceCloseOptions): void | Promise<void>;
   connect(): Promise<void>;
@@ -62,6 +65,7 @@ export type RealtimeVoiceBridgeSession = {
  */
 export type RealtimeVoiceBridgeSessionParams = {
   provider: RealtimeVoiceProviderPlugin;
+  capabilities?: InternalRealtimeVoiceProviderCapabilities;
   cfg?: OpenClawConfig;
   /** Host-selected agent scope for provider auth and agent-owned bridge state. */
   agentId?: string;
@@ -76,7 +80,8 @@ export type RealtimeVoiceBridgeSessionParams = {
   markStrategy?: RealtimeVoiceMarkStrategy;
   triggerGreetingOnReady?: boolean;
   tools?: RealtimeVoiceTool[];
-  onTranscript?: (role: RealtimeVoiceRole, text: string, isFinal: boolean) => void;
+  runAgentConsult?: RealtimeVoiceAgentConsultRunner;
+  onTranscript?: RealtimeVoiceBridgeCallbacks["onTranscript"];
   handleDelegationInput?: RealtimeVoiceBridgeCallbacks["handleDelegationInput"];
   onEvent?: (event: RealtimeVoiceBridgeEvent) => void;
   onResponseDone?: (outcome: RealtimeVoiceResponseOutcome) => void;
@@ -101,12 +106,14 @@ export function createRealtimeVoiceBridgeSession(
 ): RealtimeVoiceBridgeSession {
   const bridgeRef: { current?: RealtimeVoiceBridge } = {};
   const handleDelegationInput = params.handleDelegationInput;
+  const runAgentConsult = params.runAgentConsult;
   const getPlaybackState = params.audioSink.getPlaybackState;
   // Local disposal owns provider cleanup. Only a terminal callback fired before bridge
   // adoption may reopen; adopted bridges own reconnects and stale-event fencing internally.
   let phase: RealtimeVoiceSessionPhase = "admitting";
   let terminalBeforeBridgeAdoption = false;
   let closeReported = false;
+  let detached = false;
   let closeCompletion: Promise<void> | undefined;
   const isAdmitting = () => phase === "admitting";
   const requireBridge = () => {
@@ -128,6 +135,7 @@ export function createRealtimeVoiceBridgeSession(
   // The provider may call callbacks during createBridge(); keep the public session facade
   // stable while blocking use until the bridge object has actually been returned.
   const session: RealtimeVoiceBridgeSession = {
+    capabilities: params.capabilities,
     get bridge() {
       return requireBridge();
     },
@@ -141,6 +149,7 @@ export function createRealtimeVoiceBridgeSession(
         return closeCompletion;
       }
       const bridge = requireBridge();
+      detached = isAdmitting() && options?.disposition === "detach";
       phase = "closing";
       try {
         const completion = bridge.close(options);
@@ -182,8 +191,19 @@ export function createRealtimeVoiceBridgeSession(
       }
     },
     handleBargeIn: (options) => {
-      if (isAdmitting()) {
-        requireBridge().handleBargeIn?.(options);
+      if (!isAdmitting()) {
+        return;
+      }
+      const bridge = requireBridge();
+      if (
+        resolveRealtimeVoiceBargeIn({
+          configuredBargeIn: true,
+          interruptResponseOnInputAudio: true,
+          capabilities: params.capabilities,
+          outputAudioMode: bridge.outputAudioMode,
+        })
+      ) {
+        bridge.handleBargeIn?.(options);
       }
     },
     setMediaTimestamp: (ts) => {
@@ -231,6 +251,23 @@ export function createRealtimeVoiceBridgeSession(
     autoRespondToAudio: params.autoRespondToAudio,
     interruptResponseOnInputAudio: params.interruptResponseOnInputAudio,
     tools: params.tools,
+    ...(runAgentConsult
+      ? {
+          runAgentConsult: async (request) => {
+            if (!isAdmitting()) {
+              throw new Error("Realtime voice session is closed");
+            }
+            request.signal?.throwIfAborted();
+            const result = await runAgentConsult(request);
+            request.signal?.throwIfAborted();
+            // Replacement retires the transport, not work admitted before the handoff.
+            if (!isAdmitting() && !detached) {
+              throw new Error("Realtime voice session is closed");
+            }
+            return result;
+          },
+        }
+      : {}),
     onAudio: (audio, metadata) => {
       if (canSendAudio()) {
         params.audioSink.sendAudio(audio, metadata);
@@ -278,9 +315,10 @@ export function createRealtimeVoiceBridgeSession(
         }
       }
     },
-    onTranscript: (role, text, isFinal) => {
+    onTranscript: (...args) => {
+      const isFinal = args[2];
       if (isAdmitting() || (phase === "closing" && isFinal)) {
-        params.onTranscript?.(role, text, isFinal);
+        params.onTranscript?.(...args);
       }
     },
     ...(handleDelegationInput

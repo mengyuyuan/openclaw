@@ -33,7 +33,6 @@ import {
   repairRetiredModelSlots,
   repairModelRefAuthProfile,
 } from "../shared/retired-model-ref-repair.js";
-import { migrateLegacyDreamingPayloadShape } from "./dreaming-payload-migration.js";
 import { migrateLegacyNotifyFallback } from "./legacy-notify.js";
 import {
   archiveLegacyCronQuarantineForMigration,
@@ -60,6 +59,7 @@ import { mergeLegacyCronJobs, mergeRuntimeEntryIntoConfigJob } from "./repair-pl
 import { planCronCodexRefRewriteAgainstPersistedConfig } from "./runtime-policy-migration.js";
 import {
   assertCronStateSchemaSupported,
+  assertCronStateSchemaSupportedAsync,
   rethrowSqliteSchemaVersionError,
 } from "./schema-safety.js";
 import {
@@ -138,7 +138,7 @@ export async function loadLegacyCronRepairState(params: {
   const legacyStoreDetected = await legacyCronStoreFilesExist(storePath);
   const legacyRunLogDetected = await legacyCronRunLogFilesExist(storePath);
   const legacyQuarantine = await loadLegacyCronQuarantineForMigration(storePath);
-  assertCronStateSchemaSupported(params.env);
+  await assertCronStateSchemaSupportedAsync(params.env);
   if (
     params.onlyIfLegacyDetected &&
     !legacyStoreDetected &&
@@ -292,7 +292,6 @@ export async function applyLegacyCronStoreRepair(params: {
     jobs: state.rawJobs,
     legacyWebhook,
   });
-  const dreamingMigration = migrateLegacyDreamingPayloadShape(state.rawJobs);
   warnings.push(...notifyMigration.warnings);
   const retirementChanges: string[] = [];
   if (resolveRetired) {
@@ -337,7 +336,6 @@ export async function applyLegacyCronStoreRepair(params: {
     state.invalidConfigRows.length > 0 ||
     normalized.mutated ||
     notifyMigration.changed ||
-    dreamingMigration.changed ||
     quarantineRecovery.recoveredJobs.length > 0;
   const changed =
     state.legacyStoreDetected ||
@@ -488,11 +486,6 @@ export async function applyLegacyCronStoreRepair(params: {
     );
   } else if (storeChanged) {
     changes.push(`Cron store normalized at ${shortenHomePath(state.storePath)}.`);
-  }
-  if (dreamingMigration.rewrittenCount > 0) {
-    changes.push(
-      `Rewrote ${pluralize(dreamingMigration.rewrittenCount, "managed dreaming job")} to run as an isolated agent turn so dreaming no longer requires heartbeat.`,
-    );
   }
   if (normalized.legacyTriggerScriptJobs.length > 0) {
     changes.push(

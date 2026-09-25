@@ -19,6 +19,8 @@ import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import { PluginRegistryInspectionResources } from "../../plugins/registry-inspection-resources.js";
 import { retireInspectionInstances } from "../../plugins/registry-inspection.test-support.js";
 import { withPluginRuntimeRegistryScope } from "../../plugins/runtime/gateway-request-scope.js";
+import { getAsyncWorkSignal } from "../../shared/async-work-scope.js";
+import { closeOpenClawAgentDatabasesAsync } from "../../state/openclaw-agent-db.js";
 import { withEnv } from "../../test-utils/env.js";
 import { resolveCliBackendConfig } from "../cli-backends.js";
 import { createModelGenerationFixture } from "../embedded-agent-runner/model.generation-scope.test-support.js";
@@ -29,36 +31,8 @@ import {
   runCliTurnCompactionLifecycle,
   setCliCompactionTestDeps,
 } from "./cli-compaction.js";
+import { buildContextEngine } from "./cli-compaction.test-support.js";
 import { recordCliCompactionInStore as recordCliCompactionInStoreImpl } from "./session-store.js";
-
-function buildContextEngine(params: {
-  compactCalls: Array<Parameters<ContextEngine["compact"]>[0]>;
-}): ContextEngine {
-  return {
-    info: {
-      id: "legacy",
-      name: "Legacy Context Engine",
-    },
-    async ingest() {
-      return { ingested: false };
-    },
-    async assemble(assembleParams) {
-      return { messages: assembleParams.messages, estimatedTokens: 0 };
-    },
-    async compact(compactParams) {
-      params.compactCalls.push(compactParams);
-      return {
-        ok: true,
-        compacted: true,
-        result: {
-          summary: "compacted",
-          tokensBefore: compactParams.currentTokenCount ?? 0,
-          tokensAfter: 100,
-        },
-      };
-    },
-  };
-}
 
 async function writeSessionFile(params: { sessionFile: string; sessionId: string }) {
   // The lifecycle compacts canonical OpenClaw session JSONL, so tests write the
@@ -89,20 +63,6 @@ async function writeSessionFile(params: { sessionFile: string; sessionId: string
       "",
     ].join("\n"),
     "utf-8",
-  );
-}
-
-async function persistSessionEntry(params: {
-  sessionKey: string;
-  storePath: string;
-  entry: SessionEntry;
-}) {
-  await replaceSessionEntry(
-    {
-      sessionKey: params.sessionKey,
-      storePath: params.storePath,
-    },
-    params.entry,
   );
 }
 
@@ -185,7 +145,7 @@ async function prepareCompactionScenario(params: {
     ...params.sessionEntry,
   };
   const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
-  await persistSessionEntry({ sessionKey, storePath, entry: sessionEntry });
+  await replaceSessionEntry({ sessionKey, storePath }, sessionEntry);
 
   const compactCalls: CompactParams[] = [];
   const contextEngine =
@@ -280,6 +240,7 @@ describe("runCliTurnCompactionLifecycle", () => {
     resetCliCompactionTestDeps();
     vi.clearAllTimers();
     vi.useRealTimers();
+    await closeOpenClawAgentDatabasesAsync(tmpDir);
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -293,6 +254,7 @@ describe("runCliTurnCompactionLifecycle", () => {
       resources.register("fixture", { id: "resource", dispose: retire });
       const cleanupStarted = createDeferred();
       const cleanupGate = createDeferred();
+      const cleanupFile = path.join(tmpDir, `owned-${mode}-cleanup.txt`);
       const controller = new AbortController();
       const staleError = new Error("compaction owner retired");
       const compactCalls: CompactParams[] = [];
@@ -301,6 +263,7 @@ describe("runCliTurnCompactionLifecycle", () => {
         async dispose() {
           cleanupStarted.resolve();
           await cleanupGate.promise;
+          await fs.writeFile(cleanupFile, "disposed", { signal: getAsyncWorkSignal() });
           if (mode === "failure") {
             throw new Error("cleanup failed too");
           }
@@ -365,6 +328,7 @@ describe("runCliTurnCompactionLifecycle", () => {
           expect(error).toBe(mode === "stale" ? staleError : undefined);
         }
         expect(compactCalls).toHaveLength(mode === "native" || mode === "stale" ? 0 : 1);
+        expect(await fs.readFile(cleanupFile, "utf8")).toBe("disposed");
         expect(retire).toHaveBeenCalledTimes(1);
       } finally {
         cleanupGate.resolve();
@@ -524,7 +488,12 @@ describe("runCliTurnCompactionLifecycle", () => {
     const compactCall = compactCalls[0];
     expect(compactCall?.sessionId).toBe(sessionId);
     expect(compactCall?.sessionKey).toBe(sessionKey);
-    expect(compactCall?.sessionTarget).toEqual({ sessionId, sessionKey, storePath });
+    expect(compactCall?.sessionTarget).toEqual({
+      agentId: "main",
+      sessionId,
+      sessionKey,
+      storePath,
+    });
     expect(compactCall?.tokenBudget).toBe(1_000);
     expect(compactCall?.currentTokenCount).toBe(950);
     expect(compactCall?.force).toBe(true);
@@ -587,7 +556,12 @@ describe("runCliTurnCompactionLifecycle", () => {
     const { compactCalls, maintenance, sessionId, sessionKey, storePath } = scenario;
     await scenario.run();
 
-    expect(compactCalls[0]?.sessionTarget).toEqual({ sessionId, sessionKey, storePath });
+    expect(compactCalls[0]?.sessionTarget).toEqual({
+      agentId: "main",
+      sessionId,
+      sessionKey,
+      storePath,
+    });
     expect(maintenance).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionId: successorSessionId,
@@ -647,11 +621,10 @@ describe("runCliTurnCompactionLifecycle", () => {
       suffix: "session-key",
       tmpDir,
       result: async ({ sessionKey, storePath }) => {
-        await persistSessionEntry({
-          sessionKey,
-          storePath,
-          entry: { sessionId: successorId, updatedAt: Date.now() },
-        });
+        await replaceSessionEntry(
+          { sessionKey, storePath },
+          { sessionId: successorId, updatedAt: Date.now() },
+        );
         return {
           ok: true,
           compacted: true,
@@ -1469,7 +1442,7 @@ describe("runCliTurnCompactionLifecycle", () => {
       totalTokensVersion: SESSION_TOTAL_TOKENS_VERSION,
     };
     const sessionStore: Record<string, SessionEntry> = { [sessionKey]: sessionEntry };
-    await persistSessionEntry({ sessionKey, storePath, entry: sessionEntry });
+    await replaceSessionEntry({ sessionKey, storePath }, sessionEntry);
 
     const bigOutput = "x".repeat(20_000);
     const compactCalls: CompactParams[] = [];

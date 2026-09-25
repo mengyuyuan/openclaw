@@ -3,13 +3,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { createAgentSchemaInspectionWorker } from "../state/openclaw-agent-schema-inspection-worker.js";
 import { requireNodeSqlite } from "./node-sqlite.js";
-import { inspectSqliteSchemaHeader } from "./sqlite-snapshot-source.js";
+import { inspectSqliteSchemaHeaderInProcess } from "./sqlite-readonly-location.js";
 import { sqliteWorkerPreloadEnv } from "./sqlite-worker-preload.test-support.js";
 import { acquireStateDatabaseHandleExclusion } from "./state-database-coordinator.js";
 
 const dirs = useAutoCleanupTempDirTracker((cleanup) =>
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.unstubAllEnvs();
     cleanup();
   }),
@@ -38,8 +40,9 @@ describe("schema-header native reader lifetime", () => {
       "BEGIN IMMEDIATE; PRAGMA user_version=8; UPDATE schema_meta SET app_version='uncommitted';",
     );
     try {
-      expect(await inspectSqliteSchemaHeader(pathname)).toEqual({
-        userVersion: 7,
+      await using schemaReader = createAgentSchemaInspectionWorker();
+      expect(await schemaReader.inspect({ pathname, supportedVersion: 7 })).toEqual({
+        version: 7,
         writerAppVersion: "committed",
       });
       const competitor = spawnSync(
@@ -105,7 +108,15 @@ describe("schema-header native reader lifetime", () => {
       const before = [pathname, pathname + "-journal"].map((file) => fs.readFileSync(file));
       const cacheRoot = dirs.make("sqlite-header-journal-cache-");
       vi.stubEnv("XDG_CACHE_HOME", cacheRoot);
-      expect(await inspectSqliteSchemaHeader(pathname)).toEqual({
+      await using schemaReader = createAgentSchemaInspectionWorker();
+      await expect(
+        schemaReader.inspect({
+          pathname,
+          supportedVersion: 7,
+          requireStartupMigrationReadiness: true,
+        }),
+      ).resolves.toBeNull();
+      expect(await inspectSqliteSchemaHeaderInProcess(pathname)).toEqual({
         userVersion: 7,
         writerAppVersion: "committed",
       });
@@ -135,7 +146,17 @@ describe("schema-header native reader lifetime", () => {
         writer.close();
       }
       const before = [pathname, pathname + "-wal"].map((file) => fs.readFileSync(file));
-      expect(await inspectSqliteSchemaHeader(pathname)).toEqual({
+      if (!includeShm) {
+        await using schemaReader = createAgentSchemaInspectionWorker();
+        await expect(
+          schemaReader.inspect({
+            pathname,
+            supportedVersion: 9,
+            requireStartupMigrationReadiness: true,
+          }),
+        ).resolves.toBeNull();
+      }
+      expect(await inspectSqliteSchemaHeaderInProcess(pathname)).toEqual({
         userVersion: 9,
         writerAppVersion: "from-wal",
       });
@@ -152,20 +173,25 @@ describe("schema-header native reader lifetime", () => {
     },
   );
 
-  it.each(["success", "read-failure", "close-failure", "cancel"] as const)(
-    "keeps a consistent read and its child lease through native close: %s",
-    async (outcome) => {
+  it.each(
+    (["pooled-header", "agent-shape"] as const).flatMap((reader) =>
+      (["success", "read-failure", "close-failure", "cancel"] as const).map((outcome) => ({
+        reader,
+        outcome,
+      })),
+    ),
+  )(
+    "keeps a consistent $reader read and its child lease through native close: $outcome",
+    async ({ reader, outcome }) => {
       const root = dirs.make("sqlite-header-lifetime-");
       const pathname = path.join(root, "source.sqlite");
-      const cacheRoot = path.join(root, "cache");
-      fs.mkdirSync(cacheRoot);
       const marker = (name: string) => path.join(root, name);
       const preload = marker("lifetime.cjs");
       const writer = new (requireNodeSqlite().DatabaseSync)(pathname);
       writer.exec(`
         PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
-        CREATE TABLE schema_meta(meta_key TEXT PRIMARY KEY, app_version TEXT);
-        INSERT INTO schema_meta VALUES('primary','writer-7');
+        CREATE TABLE schema_meta(meta_key TEXT PRIMARY KEY, app_version TEXT, role TEXT, agent_id TEXT, schema_version INTEGER);
+        INSERT INTO schema_meta VALUES('primary','writer-7','agent','owner-7',7);
         PRAGMA user_version=7;
       `);
       // Faults and native pauses are installed in the actual child, not a
@@ -224,11 +250,19 @@ describe("schema-header native reader lifetime", () => {
       for (const [key, value] of Object.entries(sqliteWorkerPreloadEnv(preload))) {
         vi.stubEnv(key, value);
       }
-      vi.stubEnv("XDG_CACHE_HOME", cacheRoot);
       const controller = new AbortController();
       const cancellation = new Error("header inspection cancelled");
       let settled = false;
-      const operation = inspectSqliteSchemaHeader(pathname, { signal: controller.signal });
+      await using schemaReader = createAgentSchemaInspectionWorker();
+      const operation = schemaReader.inspect(
+        {
+          pathname,
+          supportedVersion: 8,
+          inspectOwnership: true,
+          verifyCurrentSchemaShape: reader === "agent-shape",
+        },
+        controller.signal,
+      );
       void operation.then(
         () => {
           settled = true;
@@ -242,9 +276,9 @@ describe("schema-header native reader lifetime", () => {
           timeout: 10_000,
         });
         expectSourceExcluded(pathname);
-        // This newer pair commits between the child's two metadata queries.
+        // New version and ownership facts commit between the child's metadata queries.
         writer.exec(
-          "BEGIN IMMEDIATE; PRAGMA user_version=8; UPDATE schema_meta SET app_version='writer-8'; COMMIT;",
+          "BEGIN IMMEDIATE; PRAGMA user_version=8; UPDATE schema_meta SET app_version='writer-8', agent_id='owner-8', schema_version=8; COMMIT;",
         );
         fs.writeFileSync(marker("read-release"), "resume");
         await vi.waitFor(() => expect(fs.existsSync(marker("close"))).toBe(true), {
@@ -267,13 +301,13 @@ describe("schema-header native reader lifetime", () => {
             await expect(operation).rejects.toThrow("native read failure");
           } else {
             await expect(operation).resolves.toEqual({
-              userVersion: 7,
-              writerAppVersion: "writer-7",
+              version: 7,
+              ...(reader !== "agent-shape" ? { writerAppVersion: "writer-7" } : {}),
+              agentSchemaMeta: { role: "agent", agentId: "owner-7", schemaVersion: 7 },
             });
           }
         }
         acquireStateDatabaseHandleExclusion({ databasePath: pathname, busyTimeoutMs: 0 }).release();
-        expect(fs.readdirSync(path.join(cacheRoot, "openclaw"))).toEqual([]);
         expect(writer.prepare("PRAGMA user_version").get()).toEqual({ user_version: 8 });
       } finally {
         controller.abort(cancellation);

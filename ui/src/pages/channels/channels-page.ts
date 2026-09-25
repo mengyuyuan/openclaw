@@ -15,7 +15,7 @@ import { renderLearnMoreLink } from "../../components/settings-ui.ts";
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import { t } from "../../i18n/index.ts";
 import { resolveChannelPairingAuthSignature } from "../../lib/channels/index.ts";
-import { formatUiError, formatUiExternalText } from "../../lib/format-error.ts";
+import { formatUiError } from "../../lib/format-error.ts";
 import type { GatewayConnectionScope } from "../../lib/gateway-connection-lifecycle.ts";
 import { resolveScrollBehavior } from "../../lib/scroll-behavior.ts";
 import {
@@ -108,6 +108,7 @@ class ChannelsPage extends OpenClawLightDomElement {
       }
     },
     false,
+    "visible",
   );
 
   private readonly subscriptions = new SubscriptionsController(this)
@@ -278,7 +279,7 @@ class ChannelsPage extends OpenClawLightDomElement {
     if (!context) {
       return;
     }
-    await context.runtimeConfig.refresh({ discardPendingChanges: true });
+    await context.runtimeConfig.discardDraft({ reloadOnly: true });
     await context.channels.refresh(true);
   }
 
@@ -302,14 +303,6 @@ class ChannelsPage extends OpenClawLightDomElement {
   private resolveNostrAccountId(): string {
     const accounts = this.context?.channels.state.channelsSnapshot?.channelAccounts?.nostr ?? [];
     return this.nostrProfileAccountId ?? accounts[0]?.accountId ?? "default";
-  }
-
-  private resolveGatewayHttpCredentials(gateway: ApplicationContext["gateway"]): string[] {
-    return resolveControlUiAuthCandidates({
-      hello: gateway.snapshot.hello,
-      settings: { token: gateway.connection.token },
-      password: gateway.connection.password,
-    });
   }
 
   private clearNostrForm() {
@@ -345,7 +338,11 @@ class ChannelsPage extends OpenClawLightDomElement {
       channels,
       formAccountId: this.nostrProfileAccountId,
       accountId: this.resolveNostrAccountId(),
-      authCandidates: this.resolveGatewayHttpCredentials(gateway),
+      authCandidates: resolveControlUiAuthCandidates({
+        hello: gateway.snapshot.hello,
+        settings: { token: gateway.connection.token },
+        password: gateway.connection.password,
+      }),
     };
   }
 
@@ -368,10 +365,6 @@ class ChannelsPage extends OpenClawLightDomElement {
     this.gateway.invalidate();
     this.nostrProfileAccountId = accountId;
     this.nostrProfileFormState = createNostrProfileFormState(profile ?? undefined);
-  }
-
-  private cancelNostrProfile() {
-    this.invalidateNostrForm();
   }
 
   private changeNostrProfileField(field: keyof NostrProfile, value: string) {
@@ -413,7 +406,7 @@ class ChannelsPage extends OpenClawLightDomElement {
     this.nostrProfileFormState = pendingForm;
 
     try {
-      const { data, response } = await putNostrProfile({
+      const { data, response, errorMessage } = await putNostrProfile({
         accountId: operation.accountId,
         authCandidates: operation.authCandidates,
         isCurrent: () => this.currentNostrForm(operation) !== null,
@@ -427,12 +420,7 @@ class ChannelsPage extends OpenClawLightDomElement {
         this.nostrProfileFormState = {
           ...currentForm,
           saving: false,
-          error: formatUiExternalText(
-            data?.error,
-            t("channels.nostr.notices.updateFailedStatus", {
-              status: String(response.status),
-            }),
-          ),
+          error: errorMessage,
           success: null,
           fieldErrors: parseValidationErrors(data?.details),
         };
@@ -489,7 +477,7 @@ class ChannelsPage extends OpenClawLightDomElement {
     };
 
     try {
-      const { data, response } = await importNostrProfile({
+      const { data, response, errorMessage } = await importNostrProfile({
         accountId: operation.accountId,
         authCandidates: operation.authCandidates,
         isCurrent: () => this.currentNostrForm(operation) !== null,
@@ -502,12 +490,7 @@ class ChannelsPage extends OpenClawLightDomElement {
         this.nostrProfileFormState = {
           ...currentForm,
           importing: false,
-          error: formatUiExternalText(
-            data?.error,
-            t("channels.nostr.notices.importFailedStatus", {
-              status: String(response.status),
-            }),
-          ),
+          error: errorMessage,
           success: null,
         };
         return;
@@ -661,44 +644,20 @@ class ChannelsPage extends OpenClawLightDomElement {
       </section>
       ${renderSettingsWorkspace(
         renderChannels({
-          connected: channels.connected,
-          loading: channels.channelsLoading,
-          snapshot: channels.channelsSnapshot,
-          pluginCatalog: this.pluginPresentation.pluginCatalog,
-          pluginIconUrls: this.pluginPresentation.pluginIconUrls,
-          lastError: channels.channelsError,
-          lastSuccessAt: channels.channelsLastSuccess,
-          pairingLoading: channels.pairingLoading,
-          pairingSnapshot: channels.pairingSnapshot,
-          pairingError: channels.pairingError,
-          pairingLastSuccessAt: channels.pairingLastSuccess,
-          pairingBusyRequestId: channels.pairingBusyRequestId,
+          channels,
+          config,
+          presentation: this.pluginPresentation,
+          wizardHost: this.wizardHost,
           pairingChannelFilter: this.pairingChannelFilter,
           pairingAccountFilter: this.pairingAccountFilter,
           pairingPrompt: this.pairingPrompt,
           pairingNotice: this.pairingNotice,
           canManagePairing,
           canAdmin,
-          whatsappMessage: channels.whatsappLoginMessage,
-          whatsappQrDataUrl: channels.whatsappLoginQrDataUrl,
-          whatsappConnected: channels.whatsappLoginConnected,
-          whatsappBusy: channels.whatsappBusy,
-          configSchema: config.configSchema,
-          configSchemaLoading: config.configSchemaLoading,
-          configForm: config.configForm,
-          configUiHints: config.configUiHints,
-          configSaving: config.configSaving,
-          configError: config.lastError,
-          configFormDirty: config.configFormDirty,
           showAdvancedSettings: loadSettings().showAdvancedSettings === true,
           nostrProfileFormState: this.nostrProfileFormState,
           nostrProfileAccountId: this.nostrProfileAccountId,
           selectedChannel: this.selectedChannel,
-          wizard: this.wizardHost.state,
-          wizardMultiselect: this.wizardHost.multiselect,
-          wizardTextValue: this.wizardHost.textValue,
-          wizardSecretVisible: this.wizardHost.secretVisible,
-          setupBlockedByDirtyConfig: this.wizardHost.blockedByDirtyConfig,
           onShowDetail: (channelId) => {
             this.selectedChannel = channelId;
           },
@@ -710,11 +669,6 @@ class ChannelsPage extends OpenClawLightDomElement {
               this.wizardHost.startSetup(channelId);
             }
           },
-          onWizardAnswer: (value) => this.wizardHost.answer(value),
-          onWizardToggleMultiselect: (value) => this.wizardHost.toggleMultiselect(value),
-          onWizardTextInput: (value) => this.wizardHost.setTextValue(value),
-          onWizardToggleSecretVisibility: () => this.wizardHost.toggleSecretVisibility(),
-          onWizardClose: () => this.wizardHost.close(),
           onRefresh: (probe) => void context.channels.refresh(probe),
           onPairingRefresh: () => void context.channels.refreshPairing(),
           onPairingFilterChange: (channel, accountId) => this.setPairingFilter(channel, accountId),
@@ -737,7 +691,7 @@ class ChannelsPage extends OpenClawLightDomElement {
           onConfigSave: () => void this.saveChannelConfig(),
           onConfigReload: () => void this.reloadChannelConfig(),
           onNostrProfileEdit: (accountId, profile) => this.editNostrProfile(accountId, profile),
-          onNostrProfileCancel: () => this.cancelNostrProfile(),
+          onNostrProfileCancel: () => this.invalidateNostrForm(),
           onNostrProfileFieldChange: (field, value) => this.changeNostrProfileField(field, value),
           onNostrProfileSave: () => void this.saveNostrProfile(),
           onNostrProfileImport: () => void this.importNostrProfile(),
