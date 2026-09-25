@@ -1,11 +1,11 @@
-import { describe, expect, it } from "vitest";
 import {
   createSessionProjection,
   projectLiveSessionMessage,
   reconcileSessionProjectionSnapshot,
   reduceSessionProjection,
   type SessionProjectionScope,
-} from "./session-projection.js";
+} from "./session-projection.ts";
+import { describe, expect, it } from "./shim-vitest.ts";
 
 const scope: SessionProjectionScope = {
   sessionKey: "agent:main:shared",
@@ -658,5 +658,48 @@ describe("live terminal reconciliation", () => {
       mediaCaptioned,
       mediaDistinct,
     ]);
+  });
+
+  it("holds a position-inferred final when the projection has no run record", () => {
+    const runId = "tui-partial-history-run";
+    const user = {
+      role: "user",
+      content: [{ text: "Please inspect the repository.", type: "text" }],
+      __openclaw: { id: "user-prompt", idempotencyKey: `${runId}:user`, seq: 1 },
+    };
+    const earlier = createAssistantMessage("Still working.", {
+      id: "assistant-earlier",
+      seq: 2,
+      runId,
+    });
+    const trailing = createAssistantMessage("Selected answer.", {
+      id: "assistant-trailing",
+      seq: 3,
+      runId,
+    });
+    const live = createAssistantMessage("Selected answer.");
+    let state = reconcileSessionProjectionSnapshot(
+      createSessionProjection(scope),
+      [user, earlier, trailing],
+      scope,
+    );
+    expect(state.messages).toEqual([user, earlier, trailing]);
+
+    state = projectLiveSessionMessage(state, structuredClone(live), { runId });
+    expect(state.messages).toEqual([user, earlier, trailing]);
+    expect(state.runs[runId]?.inferredSnapshotTerminal?.entry.message).toEqual(live);
+
+    const laterToolBoundary = {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Checking another file." },
+        { type: "toolCall", id: "read-2", name: "read", arguments: { path: "src/index.ts" } },
+      ],
+      __openclaw: { id: "assistant-tool-boundary", seq: 4, runId },
+    };
+    expect(
+      reconcileSessionProjectionSnapshot(state, [user, earlier, trailing, laterToolBoundary], scope)
+        .messages,
+    ).toEqual([user, earlier, trailing, laterToolBoundary, live]);
   });
 });

@@ -8,10 +8,13 @@ import {
   projectSessionTerminalReplyMessage,
 } from "./session-projection-message-content.js";
 import {
+  readAssistantStreamSegmentIdentity,
   readSessionMessageIdentity,
+  readSessionProjectionString as readNonemptyString,
   sameAssistantPersistenceReceipt,
   sameTranscriptIdentity,
   type SessionMessageIdentity,
+  type SessionProjectionEntry,
 } from "./session-projection-message-identity.js";
 
 /**
@@ -39,7 +42,7 @@ type TerminalProjectionRun = {
 };
 
 /** Tool-bearing assistant rows are continuations even without a tool stop reason. */
-export function isSessionProjectionToolContinuation(message: unknown): boolean {
+function isSessionProjectionToolContinuation(message: unknown): boolean {
   const record = readRecord(message);
   if (
     Array.isArray(record?.content) &&
@@ -337,7 +340,7 @@ function findUniqueTerminalContentMatch<T extends TerminalProjectionEntry>(
  * Match an unsequenced live replay to exactly one durable row sharing the same
  * terminal evidence and full display content as snapshot reconciliation.
  */
-export function findUniqueLiveTerminalMatch<T extends TerminalProjectionEntry>(
+function findUniqueLiveTerminalMatch<T extends TerminalProjectionEntry>(
   current: TerminalProjectionEntry,
   matches: readonly T[],
   snapshot: readonly TerminalProjectionEntry[],
@@ -428,7 +431,7 @@ function isDistinctLaterLiveFinal(
  * it: without explicit terminal evidence, a contradicted position match would
  * have no recovery record to restore the suppressed reply.
  */
-export function shouldKeepLaterFinalVisible(
+function shouldKeepLaterFinalVisible(
   entry: TerminalProjectionEntry,
   matched: TerminalProjectionEntry,
   run: TerminalProjectionRun | undefined,
@@ -437,7 +440,7 @@ export function shouldKeepLaterFinalVisible(
 }
 
 /** A single candidate still goes through the ambiguous-replay evidence check. */
-export function findAdoptableMatch<T extends TerminalProjectionEntry>(
+function findAdoptableMatch<T extends TerminalProjectionEntry>(
   matches: readonly T[],
 ): T | undefined {
   const single = matches.length === 1 ? matches[0] : undefined;
@@ -469,22 +472,172 @@ export function isToolContinuationOwner(
 /**
  * Resolve how an unkeyed live terminal projection is adopted by a durable row:
  * persistence receipts suppress directly (no inference needed), position
- * matches keep a recovery record, and a later distinct final stays visible.
+ * matches keep a recovery record (or ask the caller to hold one when the run
+ * record is missing), and a later distinct final stays visible.
  */
 export function resolveLiveAdoption<TRun extends { message?: unknown; status: string }>(
   entry: TerminalProjectionEntry,
   matched: TerminalProjectionEntry,
   runs: Readonly<Record<string, TRun>>,
-): { runId: string | null; recovery: TRun | null; keepVisible: boolean } {
+): { runId: string | null; recovery: TRun | null; keepVisible: boolean; holdInferred: boolean } {
   const runId = entry.identity?.runId ?? null;
   if (sameAssistantPersistenceReceipt(matched.identity, entry.identity)) {
-    return { runId, recovery: null, keepVisible: false };
+    return { runId, recovery: null, keepVisible: false, holdInferred: false };
   }
-  const recovery = withTentativeRecovery(runId ? runs[runId] : undefined, entry, matched);
+  const run = runId ? runs[runId] : undefined;
+  const recovery = withTentativeRecovery(run, entry, matched);
+  if (recovery) {
+    return { runId, recovery, keepVisible: false, holdInferred: false };
+  }
+  // A position-inferred suppression is recoverable only through its run
+  // record. Without one (the TUI publishes finals without run events) the
+  // caller must hold the reply so later history can still restore it.
+  const positional =
+    entry.identity?.role === "assistant" &&
+    !hasExplicitTerminalEvidence(matched) &&
+    entry.afterSequence === undefined;
+  if (positional && !run && runId !== null) {
+    return { runId, recovery: null, keepVisible: false, holdInferred: true };
+  }
   return {
     runId,
-    recovery,
-    keepVisible:
-      !recovery && shouldKeepLaterFinalVisible(entry, matched, runId ? runs[runId] : undefined),
+    recovery: null,
+    keepVisible: shouldKeepLaterFinalVisible(entry, matched, run),
+    holdInferred: false,
   };
+}
+
+/**
+ * Whether later rows prove a position match that suppressed a live reply was
+ * wrong: the matched row no longer closes its run in the latest snapshot.
+ */
+export function isContradictedPositionMatch(
+  entries: readonly TerminalProjectionEntry[],
+  runId: string,
+  matchedIdentity: SessionMessageIdentity,
+): boolean {
+  const matched = entries.find((entry) => sameTranscriptIdentity(entry.identity, matchedIdentity));
+  return Boolean(
+    matched && !createRunSnapshotChecks(entries, runId).isLastSameRunAssistantRow(matched),
+  );
+}
+
+export function entryMatches(
+  left: SessionProjectionEntry,
+  right: SessionProjectionEntry,
+  allowSnapshotPromotion = false,
+): boolean {
+  const leftSegment = readAssistantStreamSegmentIdentity(left.message);
+  const rightSegment = readAssistantStreamSegmentIdentity(right.message);
+  // One transcript row can contain separate commentary and tool display parts.
+  if (leftSegment?.itemId !== rightSegment?.itemId) {
+    return false;
+  }
+  if (sameTranscriptIdentity(left.identity, right.identity)) {
+    return true;
+  }
+  if (sameAssistantPersistenceReceipt(left.identity, right.identity)) {
+    return true;
+  }
+  if (
+    left.identity?.role === "assistant" &&
+    right.identity?.role === "assistant" &&
+    left.identity.idempotencyKey &&
+    right.identity.idempotencyKey &&
+    left.identity.idempotencyKey !== right.identity.idempotencyKey
+  ) {
+    return false;
+  }
+  const durableEntry = left.identity?.id ? left : right.identity?.id ? right : null;
+  const provisionalEntry = durableEntry === left ? right : durableEntry === right ? left : null;
+  const durableMetadata = readRecord(readRecord(durableEntry?.message)?.["__openclaw"]);
+  if (
+    durableEntry?.identity?.role === "assistant" &&
+    provisionalEntry?.identity?.role === "assistant" &&
+    !durableEntry.identity.isImported &&
+    !provisionalEntry.identity.isImported &&
+    !provisionalEntry.identity.id
+  ) {
+    const durableSegment = durableEntry === left ? leftSegment : rightSegment;
+    const provisionalSegment = durableEntry === left ? rightSegment : leftSegment;
+    // Terminal cleanup can materialize commentary before cursor history catches up.
+    // Adopt its exact item/run without joining distinct durable rows or equal prose.
+    if (
+      provisionalEntry.identity.sequence === null &&
+      durableSegment?.runId &&
+      durableSegment.runId === provisionalSegment?.runId &&
+      durableSegment.itemId === provisionalSegment.itemId
+    ) {
+      return true;
+    }
+    // Commentary rows cannot own an unkeyed final answer. Tool-bearing rows
+    // stay matchable so ambiguous replay matching still weighs them as
+    // candidates; adoption and in-place replacement veto them at the
+    // selection layer instead (see projectLiveSessionMessage).
+    if (
+      provisionalEntry.live &&
+      !durableSegment &&
+      // Admitting a text-only toolUse-persisted final must not let it merge
+      // with a *different* same-run answer in either direction: the kept side
+      // suppresses or replaces the other without any content comparison
+      // downstream. Scope the content requirement to that newly admitted
+      // class only; pre-existing matches (identity promotions, non-toolUse
+      // rows) keep their established semantics.
+      (!isToolUsePersistedFinalRow(durableEntry.message) ||
+        readFinalContentIdentity(durableEntry.message) ===
+          readFinalContentIdentity(provisionalEntry.message)) &&
+      provisionalEntry.identity.sequence === null &&
+      (provisionalEntry.afterSequence === undefined ||
+        (provisionalEntry.afterSequence !== null &&
+          durableEntry.identity.sequence !== null &&
+          durableEntry.identity.sequence > provisionalEntry.afterSequence)) &&
+      durableEntry.identity.runId &&
+      durableEntry.identity.runId === provisionalEntry.identity.runId &&
+      (readNonemptyString(durableMetadata?.mirrorOrigin) === null ||
+        durableMetadata?.runTerminal === true)
+    ) {
+      return true;
+    }
+  }
+  const persisted = left.identity;
+  const observed = right.identity;
+  if (
+    allowSnapshotPromotion &&
+    right.live &&
+    persisted &&
+    observed &&
+    persisted.role === observed.role &&
+    !persisted.isImported &&
+    !observed.isImported &&
+    persisted.id &&
+    !observed.id &&
+    persisted.sequence !== null &&
+    persisted.sequence === observed.sequence
+  ) {
+    // Only current-scope history can promote an observed native sequence.
+    return true;
+  }
+  if (left.pending && right.pending) {
+    return Boolean(
+      left.identity?.role === right.identity?.role &&
+      left.pendingRunId &&
+      left.pendingRunId === right.pendingRunId,
+    );
+  }
+  const pending = left.pending ? left : right.pending ? right : null;
+  const authoritative = pending === left ? right : pending === right ? left : null;
+  return Boolean(
+    pending &&
+    authoritative &&
+    pending.identity &&
+    authoritative.identity &&
+    pending.identity.role === authoritative.identity.role &&
+    !pending.identity.isImported &&
+    !authoritative.identity.isImported &&
+    pending.pendingRunId &&
+    pending.pendingRunId === (authoritative.identity.sendId ?? authoritative.identity.runId) &&
+    (pending.identity.sequence === null ||
+      authoritative.identity.sequence === null ||
+      pending.identity.sequence === authoritative.identity.sequence),
+  );
 }
